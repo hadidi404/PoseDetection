@@ -11,52 +11,7 @@ CSV_FILE = "armwrestling_data.csv"
 VISIBILITY_THRESHOLD = 0.9
 NUM_POINTS = 48  # 48 landmarks (21 left hand + 3 arm + 21 right hand + 3 arm)
 
-# Ideal arm wrestling pose parameters
-IDEAL_ELBOW_ANGLE = 90
-ELBOW_TOLERANCE = 15
-IDEAL_WRIST_STRAIGHTNESS = 170  # Close to 180° = straight
-WRIST_TOLERANCE = 20
-
-# ---------------- TRAIN MODEL ----------------
-if not os.path.exists(CSV_FILE):
-    raise FileNotFoundError(f"{CSV_FILE} not found. Record data first.")
-
-print(f"Loading data from {CSV_FILE} ...")
-df = pd.read_csv(CSV_FILE)
-
-# Extract only numeric features (ignore label)
-X = df.drop(columns=['label']).values
-
-print(f"Training data shape: {X.shape}")
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-
-# Train unsupervised model on "correct" poses
-model = OneClassSVM(kernel='rbf', gamma='auto', nu=0.05)
-model.fit(X_scaled)
-
-# Compute adaptive threshold
-scores = model.score_samples(X_scaled)
-auto_threshold = scores.mean()  # instead of using min or median
-threshold = auto_threshold - 3  # lower by 2 points to allow more flexibility
-
-print(f"Training complete ✅")
-print(f"Score range: [{scores.min():.3f}, {scores.max():.3f}]")
-print(f"Auto threshold: {threshold:.3f}")
-
-# Calculate reference pose metrics from training data
-print("Calculating reference pose metrics...")
-reference_metrics = {
-    'left_elbow_angles': [],
-    'right_elbow_angles': [],
-    'left_shoulder_heights': [],
-    'right_shoulder_heights': [],
-    'left_hand_closure': [],  # Distance from thumb to pinky
-    'right_hand_closure': [],
-    'left_finger_curl': [],  # Average curl of fingers
-    'right_finger_curl': []
-}
-
+# ---------------- HELPER FUNCTIONS ----------------
 def calculate_angle(a, b, c):
     """Calculate angle at point b given three points a, b, c."""
     a = np.array(a)
@@ -75,109 +30,114 @@ def calculate_distance(a, b):
     """Calculate Euclidean distance between two points."""
     return np.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
 
-# Compute reference metrics from training data
-for idx, row in df.iterrows():
-    features = row.drop('label').values
-    # Left hand: 0-62 (21 landmarks * 3), Left arm: 63-71 (3 landmarks * 3)
-    # Right hand: 72-134 (21 landmarks * 3), Right arm: 135-143 (3 landmarks * 3)
+FEATURE_NAMES = [
+    'Left Elbow Angle', 'Right Elbow Angle',
+    'Left Hand Closure', 'Right Hand Closure',
+    'Left Finger Curl', 'Right Finger Curl',
+    'Shoulder Level Diff'
+]
+
+def extract_features(row):
+    """
+    Convert 144-point raw landmark data into meaningful biomechanical features.
+    Input: row (numpy array of 144 values)
+    Output: numpy array of features
+    """
+    features = []
     
-    if len(features) == 144:
-        # Left hand landmarks (21 points * 3 coords = 63 values)
-        left_hand = features[0:63].reshape(21, 3)
-        # Left arm: shoulder(63-65), elbow(66-68), wrist(69-71)
-        left_shoulder = features[63:66]
-        left_elbow = features[66:69]
-        left_wrist = features[69:72]
-        
-        # Right hand landmarks
-        right_hand = features[72:135].reshape(21, 3)
-        # Right arm: shoulder(135-137), elbow(138-140), wrist(141-143)
-        right_shoulder = features[135:138]
-        right_elbow = features[138:141]
-        right_wrist = features[141:144]
-        
-        # Calculate arm angles
-        left_angle = calculate_angle(left_shoulder[:2], left_elbow[:2], left_wrist[:2])
-        right_angle = calculate_angle(right_shoulder[:2], right_elbow[:2], right_wrist[:2])
-        
-        reference_metrics['left_elbow_angles'].append(left_angle)
-        reference_metrics['right_elbow_angles'].append(right_angle)
-        reference_metrics['left_shoulder_heights'].append(left_shoulder[1])
-        reference_metrics['right_shoulder_heights'].append(right_shoulder[1])
-        
-        # Calculate hand metrics
-        # Hand landmarks: 0=wrist, 4=thumb_tip, 8=index_tip, 12=middle_tip, 16=ring_tip, 20=pinky_tip
-        
-        # Left hand: closure (thumb to pinky distance)
-        left_thumb_tip = left_hand[4][:2]
-        left_pinky_tip = left_hand[20][:2]
-        left_closure = calculate_distance(left_thumb_tip, left_pinky_tip)
-        reference_metrics['left_hand_closure'].append(left_closure)
-        
-        # Left hand: finger curl (average distance from fingertips to wrist)
-        left_wrist_pos = left_hand[0][:2]
-        left_finger_distances = []
-        for tip_idx in [4, 8, 12, 16, 20]:  # All fingertips
-            left_finger_distances.append(calculate_distance(left_hand[tip_idx][:2], left_wrist_pos))
-        left_avg_curl = np.mean(left_finger_distances)
-        reference_metrics['left_finger_curl'].append(left_avg_curl)
-        
-        # Right hand metrics
-        right_thumb_tip = right_hand[4][:2]
-        right_pinky_tip = right_hand[20][:2]
-        right_closure = calculate_distance(right_thumb_tip, right_pinky_tip)
-        reference_metrics['right_hand_closure'].append(right_closure)
-        
-        right_wrist_pos = right_hand[0][:2]
-        right_finger_distances = []
-        for tip_idx in [4, 8, 12, 16, 20]:
-            right_finger_distances.append(calculate_distance(right_hand[tip_idx][:2], right_wrist_pos))
-        right_avg_curl = np.mean(right_finger_distances)
-        reference_metrics['right_finger_curl'].append(right_avg_curl)
+    # Indices based on DataCollection.py structure:
+    # Left Hand: 0-62 (21*3)
+    # Left Arm: 63-71 (3*3) -> Shoulder(63-65), Elbow(66-68), Wrist(69-71)
+    # Right Hand: 72-134 (21*3)
+    # Right Arm: 135-143 (3*3) -> Shoulder(135-137), Elbow(138-140), Wrist(141-143)
+    
+    # Extract Arm Points (x, y only for 2D angles)
+    l_sh = row[63:65]
+    l_el = row[66:68]
+    l_wr = row[69:71]
+    
+    r_sh = row[135:137]
+    r_el = row[138:140]
+    r_wr = row[141:143]
+    
+    # 1. Elbow Angles
+    features.append(calculate_angle(l_sh, l_el, l_wr))
+    features.append(calculate_angle(r_sh, r_el, r_wr))
+    
+    # Extract Hand Points
+    l_hand = row[0:63].reshape(21, 3)
+    r_hand = row[72:135].reshape(21, 3)
+    
+    # 2. Hand Closure (Thumb tip to Pinky tip distance)
+    # Index 4=Thumb Tip, 20=Pinky Tip
+    features.append(calculate_distance(l_hand[4][:2], l_hand[20][:2]))
+    features.append(calculate_distance(r_hand[4][:2], r_hand[20][:2]))
+    
+    # 3. Finger Curl (Average distance from fingertips to wrist)
+    # Tips: 4, 8, 12, 16, 20. Wrist: 0
+    l_wrist_pt = l_hand[0][:2]
+    l_tips = [l_hand[i][:2] for i in [4, 8, 12, 16, 20]]
+    features.append(np.mean([calculate_distance(p, l_wrist_pt) for p in l_tips]))
+    
+    r_wrist_pt = r_hand[0][:2]
+    r_tips = [r_hand[i][:2] for i in [4, 8, 12, 16, 20]]
+    features.append(np.mean([calculate_distance(p, r_wrist_pt) for p in r_tips]))
+    
+    # 4. Shoulder Level Difference (Vertical distance)
+    # y is at index 1
+    features.append(abs(l_sh[1] - r_sh[1]))
+    
+    return np.array(features)
 
-# Calculate ideal values and acceptable ranges from professional data
-ideal_left_elbow = np.median(reference_metrics['left_elbow_angles']) if reference_metrics['left_elbow_angles'] else IDEAL_ELBOW_ANGLE
-ideal_right_elbow = np.median(reference_metrics['right_elbow_angles']) if reference_metrics['right_elbow_angles'] else IDEAL_ELBOW_ANGLE
-ideal_left_shoulder_height = np.median(reference_metrics['left_shoulder_heights']) if reference_metrics['left_shoulder_heights'] else 0
-ideal_right_shoulder_height = np.median(reference_metrics['right_shoulder_heights']) if reference_metrics['right_shoulder_heights'] else 0
+# ---------------- TRAIN MODEL ----------------
+if not os.path.exists(CSV_FILE):
+    raise FileNotFoundError(f"{CSV_FILE} not found. Record data first.")
 
-# Hand metrics
-ideal_left_hand_closure = np.median(reference_metrics['left_hand_closure']) if reference_metrics['left_hand_closure'] else 0
-ideal_right_hand_closure = np.median(reference_metrics['right_hand_closure']) if reference_metrics['right_hand_closure'] else 0
-ideal_left_finger_curl = np.median(reference_metrics['left_finger_curl']) if reference_metrics['left_finger_curl'] else 0
-ideal_right_finger_curl = np.median(reference_metrics['right_finger_curl']) if reference_metrics['right_finger_curl'] else 0
+print(f"Loading data from {CSV_FILE} ...")
+df = pd.read_csv(CSV_FILE)
 
-# Calculate acceptable ranges from professional variation (data-driven thresholds)
-left_elbow_std = np.std(reference_metrics['left_elbow_angles']) if reference_metrics['left_elbow_angles'] else ELBOW_TOLERANCE
-right_elbow_std = np.std(reference_metrics['right_elbow_angles']) if reference_metrics['right_elbow_angles'] else ELBOW_TOLERANCE
-elbow_tolerance_left = max(10, left_elbow_std * 1.5)  # 1.5 std deviation as tolerance
-elbow_tolerance_right = max(10, right_elbow_std * 1.5)
+# Extract features from raw data
+print("Extracting biomechanical features...")
+raw_data = df.drop(columns=['label']).values
+feature_list = []
+valid_indices = []
 
-# Hand tolerances
-left_closure_std = np.std(reference_metrics['left_hand_closure']) if reference_metrics['left_hand_closure'] else 50
-right_closure_std = np.std(reference_metrics['right_hand_closure']) if reference_metrics['right_hand_closure'] else 50
-hand_closure_tolerance_left = max(30, left_closure_std * 1.5)
-hand_closure_tolerance_right = max(30, right_closure_std * 1.5)
+for i, row in enumerate(raw_data):
+    if len(row) == 144:
+        try:
+            feats = extract_features(row)
+            feature_list.append(feats)
+            valid_indices.append(i)
+        except Exception as e:
+            pass
 
-left_curl_std = np.std(reference_metrics['left_finger_curl']) if reference_metrics['left_finger_curl'] else 30
-right_curl_std = np.std(reference_metrics['right_finger_curl']) if reference_metrics['right_finger_curl'] else 30
-finger_curl_tolerance_left = max(20, left_curl_std * 1.5)
-finger_curl_tolerance_right = max(20, right_curl_std * 1.5)
+X_features = np.array(feature_list)
+print(f"Training data shape: {X_features.shape} (Samples, Features)")
 
+# Train Scaler and Model on FEATURES
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_features)
+
+# Train unsupervised model on "correct" feature vectors
+model = OneClassSVM(kernel='rbf', gamma='auto', nu=0.05)
+model.fit(X_scaled)
+
+# Compute adaptive threshold
+scores = model.score_samples(X_scaled)
+auto_threshold = scores.mean() - 3 * scores.std() # Statistical threshold
+
+print(f"Training complete ✅")
+print(f"Score range: [{scores.min():.3f}, {scores.max():.3f}]")
+print(f"Auto threshold: {auto_threshold:.3f}")
+
+# Print learned baselines
 print(f"\n{'='*60}")
-print(f"Reference metrics from {len(reference_metrics['left_elbow_angles'])} professional samples:")
+print(f"LEARNED PROFESSIONAL BASELINES (Mean ± Std Dev):")
 print(f"{'='*60}")
-print(f"ARM ANGLES:")
-print(f"  Left elbow angle:  {ideal_left_elbow:.1f}° ± {elbow_tolerance_left:.1f}°")
-print(f"  Right elbow angle: {ideal_right_elbow:.1f}° ± {elbow_tolerance_right:.1f}°")
-print(f"\nHAND METRICS:")
-print(f"  Left hand closure:  {ideal_left_hand_closure:.1f}px ± {hand_closure_tolerance_left:.1f}px")
-print(f"  Right hand closure: {ideal_right_hand_closure:.1f}px ± {hand_closure_tolerance_right:.1f}px")
-print(f"  Left finger curl:   {ideal_left_finger_curl:.1f}px ± {finger_curl_tolerance_left:.1f}px")
-print(f"  Right finger curl:  {ideal_right_finger_curl:.1f}px ± {finger_curl_tolerance_right:.1f}px")
-print(f"\nAcceptable ranges (learned from professionals):")
-print(f"  ✅ Left elbow:  {ideal_left_elbow - elbow_tolerance_left:.1f}° - {ideal_left_elbow + elbow_tolerance_left:.1f}°")
-print(f"  ✅ Right elbow: {ideal_right_elbow - elbow_tolerance_right:.1f}° - {ideal_right_elbow + elbow_tolerance_right:.1f}°")
+for i, name in enumerate(FEATURE_NAMES):
+    mean_val = scaler.mean_[i]
+    std_val = np.sqrt(scaler.var_[i])
+    print(f"{name:<20}: {mean_val:.1f} ± {std_val:.1f}")
 print(f"{'='*60}\n")
 
 # ---------------- REAL-TIME TEST ----------------
@@ -213,193 +173,93 @@ def extract_data_row(results):
 
     return np.array(data_row) if len(data_row) == NUM_POINTS * 3 else None
 
-def analyze_pose(results, img_width, img_height):
-    """Analyze pose and provide specific feedback."""
+def analyze_pose_ml(row, scaler, model, feature_names):
+    """
+    Analyze pose using the ML model and Feature Deviation.
+    Returns: feedback list, scores dict, joint colors dict
+    """
     feedback = []
     scores = {}
     joint_colors = {}
     
-    if not results.pose_landmarks:
-        return feedback, scores, joint_colors
+    # 1. Extract Features
+    try:
+        features = extract_features(row)
+    except:
+        return feedback, scores, joint_colors, -100
+        
+    # 2. Scale Features (Z-scores)
+    # Reshape to (1, n_features)
+    features_reshaped = features.reshape(1, -1)
+    features_scaled = scaler.transform(features_reshaped)
     
-    lm = results.pose_landmarks.landmark
+    # 3. Get ML Score
+    ml_score = model.score_samples(features_scaled)[0]
     
-    # Analyze both arms
-    arms = {
-        'Left': {'shoulder': 11, 'elbow': 13, 'wrist': 15, 'ideal_angle': ideal_left_elbow},
-        'Right': {'shoulder': 12, 'elbow': 14, 'wrist': 16, 'ideal_angle': ideal_right_elbow}
+    # 4. Analyze Deviations (Z-scores)
+    # A Z-score > 2 means the value is 2 standard deviations away from the professional mean
+    z_scores = features_scaled[0]
+    
+    # Map features to joints for coloring
+    # 0: L Elbow, 1: R Elbow, 2: L Hand, 3: R Hand, 4: L Curl, 5: R Curl, 6: Shoulders
+    feature_map = {
+        0: 'left_elbow', 1: 'right_elbow',
+        2: 'left_hand', 3: 'right_hand',
+        4: 'left_hand', 5: 'right_hand',
+        6: 'shoulders'
     }
     
-    for side, indices in arms.items():
-        # Check visibility
-        if all(lm[i].visibility > VISIBILITY_THRESHOLD for i in [indices['shoulder'], indices['elbow'], indices['wrist']]):
-            # Get coordinates
-            shoulder = [lm[indices['shoulder']].x * img_width, lm[indices['shoulder']].y * img_height]
-            elbow = [lm[indices['elbow']].x * img_width, lm[indices['elbow']].y * img_height]
-            wrist = [lm[indices['wrist']].x * img_width, lm[indices['wrist']].y * img_height]
+    for i, z in enumerate(z_scores):
+        feat_name = feature_names[i]
+        abs_z = abs(z)
+        
+        # Score (0-100) based on deviation
+        # 0 deviation = 100%, 3 deviation = 0%
+        score = max(0, 100 - (abs_z * 33))
+        scores[feat_name] = score
+        
+        # Determine Status
+        status = "OK"
+        if abs_z > 3.0: status = "CRITICAL"
+        elif abs_z > 2.0: status = "WARNING"
+        
+        # Generate Feedback
+        if status != "OK":
+            direction = "High" if z > 0 else "Low"
             
-            # Calculate elbow angle
-            elbow_angle = calculate_angle(shoulder, elbow, wrist)
-            ideal_angle = indices['ideal_angle']
-            tolerance = elbow_tolerance_left if side == 'Left' else elbow_tolerance_right
-            angle_diff = abs(elbow_angle - ideal_angle)
-            
-            # Score the elbow (0-100) based on data-driven tolerance
-            elbow_score = max(0, 100 - (angle_diff / tolerance) * 100)
-            scores[f'{side.lower()}_elbow'] = elbow_score
-            
-            # Determine color and feedback based on data-driven tolerance
-            if angle_diff <= tolerance:
-                joint_colors[f'{side.lower()}_elbow'] = (0, 255, 0)  # Green
-            elif angle_diff <= tolerance * 2:
-                joint_colors[f'{side.lower()}_elbow'] = (0, 255, 255)  # Yellow
-                if elbow_angle < ideal_angle:
-                    feedback.append(f"{side} elbow: Straighten more ({elbow_angle:.0f}° → {ideal_angle:.0f}°)")
-                else:
-                    feedback.append(f"{side} elbow: Bend more ({elbow_angle:.0f}° → {ideal_angle:.0f}°)")
-            else:
-                joint_colors[f'{side.lower()}_elbow'] = (0, 0, 255)  # Red
-                if elbow_angle < ideal_angle:
-                    feedback.append(f"❌ {side} elbow: Too bent! Straighten ({elbow_angle:.0f}° → {ideal_angle:.0f}°)")
-                else:
-                    feedback.append(f"❌ {side} elbow: Too straight! Bend ({elbow_angle:.0f}° → {ideal_angle:.0f}°)")
-            
-            # Check wrist alignment (should be in line with forearm)
-            forearm_angle = np.arctan2(wrist[1] - elbow[1], wrist[0] - elbow[0]) * 180 / np.pi
-            
-            # Check shoulder height alignment
-            shoulder_height_diff = abs(lm[11].y - lm[12].y) * img_height
-            if shoulder_height_diff > 50:  # More than 50 pixels difference
-                feedback.append(f"⚠️ Keep shoulders level (diff: {shoulder_height_diff:.0f}px)")
-                scores['shoulder_alignment'] = max(0, 100 - shoulder_height_diff)
-            else:
-                scores['shoulder_alignment'] = 100
-    
-    # Analyze hand positions and grip
-    hands_config = {
-        'Left': {
-            'landmarks': results.left_hand_landmarks,
-            'ideal_closure': ideal_left_hand_closure,
-            'ideal_curl': ideal_left_finger_curl,
-            'closure_tolerance': hand_closure_tolerance_left,
-            'curl_tolerance': finger_curl_tolerance_left
-        },
-        'Right': {
-            'landmarks': results.right_hand_landmarks,
-            'ideal_closure': ideal_right_hand_closure,
-            'ideal_curl': ideal_right_finger_curl,
-            'closure_tolerance': hand_closure_tolerance_right,
-            'curl_tolerance': finger_curl_tolerance_right
-        }
-    }
-    
-    for side, config in hands_config.items():
-        if config['landmarks']:
-            hand_lm = config['landmarks'].landmark
-            
-            # Get key hand points in pixel coordinates
-            thumb_tip = [hand_lm[4].x * img_width, hand_lm[4].y * img_height]
-            index_tip = [hand_lm[8].x * img_width, hand_lm[8].y * img_height]
-            middle_tip = [hand_lm[12].x * img_width, hand_lm[12].y * img_height]
-            ring_tip = [hand_lm[16].x * img_width, hand_lm[16].y * img_height]
-            pinky_tip = [hand_lm[20].x * img_width, hand_lm[20].y * img_height]
-            wrist_pos = [hand_lm[0].x * img_width, hand_lm[0].y * img_height]
-            
-            # Calculate hand closure (thumb to pinky distance)
-            hand_closure = calculate_distance(thumb_tip, pinky_tip)
-            closure_diff = abs(hand_closure - config['ideal_closure'])
-            closure_score = max(0, 100 - (closure_diff / config['closure_tolerance']) * 100)
-            scores[f'{side.lower()}_hand_grip'] = closure_score
-            
-            # Calculate finger curl (average fingertip to wrist distance)
-            finger_distances = [
-                calculate_distance(thumb_tip, wrist_pos),
-                calculate_distance(index_tip, wrist_pos),
-                calculate_distance(middle_tip, wrist_pos),
-                calculate_distance(ring_tip, wrist_pos),
-                calculate_distance(pinky_tip, wrist_pos)
-            ]
-            avg_curl = np.mean(finger_distances)
-            curl_diff = abs(avg_curl - config['ideal_curl'])
-            curl_score = max(0, 100 - (curl_diff / config['curl_tolerance']) * 100)
-            
-            # Combine hand metrics
-            hand_score = (closure_score + curl_score) / 2
-            scores[f'{side.lower()}_hand'] = hand_score
-            
-            # Provide feedback
-            if closure_diff > config['closure_tolerance']:
-                if hand_closure > config['ideal_closure']:
-                    feedback.append(f"⚠️ {side} hand: Grip tighter (fingers too spread)")
-                else:
-                    feedback.append(f"⚠️ {side} hand: Relax grip slightly")
-            
-            if curl_diff > config['curl_tolerance']:
-                if avg_curl < config['ideal_curl']:
-                    feedback.append(f"⚠️ {side} hand: Extend fingers more")
-                else:
-                    feedback.append(f"⚠️ {side} hand: Curl fingers more")
-    
-    return feedback, scores, joint_colors
+            # Custom messages based on feature type
+            if "Elbow Angle" in feat_name:
+                msg = "Straighten" if direction == "Low" else "Bend"
+                feedback.append(f"⚠️ {feat_name}: {msg} ({features[i]:.0f}°)")
+                joint_colors[feature_map[i]] = (0, 0, 255) if status == "CRITICAL" else (0, 255, 255)
+                
+            elif "Hand Closure" in feat_name:
+                # High distance = Open. Low distance = Closed.
+                # If Z is positive (High distance) -> Too Open -> "Grip Tighter"
+                msg = "Grip Tighter" if direction == "High" else "Relax Grip"
+                feedback.append(f"⚠️ {feat_name}: {msg}")
+                
+            elif "Finger Curl" in feat_name:
+                # High distance = Extended. Low distance = Curled.
+                msg = "Curl Fingers" if direction == "High" else "Extend Fingers" 
+                feedback.append(f"⚠️ {feat_name}: {msg}")
+                
+            elif "Shoulder" in feat_name:
+                feedback.append(f"⚠️ Level Shoulders")
+                
+    return feedback, scores, joint_colors, ml_score
 
 def draw_joint_circles(img, results, joint_colors):
-    """Draw colored circles on joints based on correctness."""
-    if not results.pose_landmarks:
-        return
-    
+    if not results.pose_landmarks: return
     lm = results.pose_landmarks.landmark
     h, w, _ = img.shape
-    
-    joints = {
-        'left_elbow': 13,
-        'right_elbow': 14,
-        'left_wrist': 15,
-        'right_wrist': 16,
-        'left_shoulder': 11,
-        'right_shoulder': 12
-    }
-    
-    for joint_name, idx in joints.items():
+    joints = {'left_elbow': 13, 'right_elbow': 14, 'left_wrist': 15, 'right_wrist': 16, 'left_shoulder': 11, 'right_shoulder': 12}
+    for name, idx in joints.items():
         if lm[idx].visibility > VISIBILITY_THRESHOLD:
-            x = int(lm[idx].x * w)
-            y = int(lm[idx].y * h)
-            
-            # Get color for this joint (default to blue if not analyzed)
-            color = joint_colors.get(joint_name, (255, 0, 0))
-            
-            # Draw circle
+            x, y = int(lm[idx].x * w), int(lm[idx].y * h)
+            color = joint_colors.get(name, (0, 255, 0)) # Default Green
             cv2.circle(img, (x, y), 12, color, -1)
-            cv2.circle(img, (x, y), 14, (255, 255, 255), 2)  # White border
-
-def draw_legend(img):
-    """Draw color legend for joint indicators."""
-    h, w, _ = img.shape
-    legend_x = w - 200
-    legend_y = 30
-    
-    # Background for legend
-    cv2.rectangle(img, (legend_x - 10, legend_y - 10), (w - 10, legend_y + 90), (0, 0, 0), -1)
-    cv2.rectangle(img, (legend_x - 10, legend_y - 10), (w - 10, legend_y + 90), (255, 255, 255), 2)
-    
-    # Title
-    cv2.putText(img, "Joint Status:", (legend_x, legend_y + 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
-    # Green - Good
-    cv2.circle(img, (legend_x + 10, legend_y + 35), 6, (0, 255, 0), -1)
-    cv2.putText(img, "Correct", (legend_x + 25, legend_y + 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    
-    # Yellow - Warning
-    cv2.circle(img, (legend_x + 10, legend_y + 55), 6, (0, 255, 255), -1)
-    cv2.putText(img, "Adjust", (legend_x + 25, legend_y + 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    
-    # Red - Wrong
-    cv2.circle(img, (legend_x + 10, legend_y + 75), 6, (0, 0, 255), -1)
-    cv2.putText(img, "Fix", (legend_x + 25, legend_y + 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-
+            cv2.circle(img, (x, y), 14, (255, 255, 255), 2)
 
 with mp_holistic.Holistic(
     static_image_mode=False,
@@ -413,68 +273,46 @@ with mp_holistic.Holistic(
     print("Press ESC to quit.")
     while True:
         ret, img = cap.read()
-        if not ret:
-            continue
+        if not ret: continue
 
         img = cv2.flip(img, 1)
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = holistic.process(img_rgb)
-        
         h, w, _ = img.shape
 
         data_row = extract_data_row(results)
         
-        # Analyze pose for specific feedback
-        feedback, scores, joint_colors = analyze_pose(results, w, h)
-
         if data_row is None:
-            cv2.putText(img, "Incomplete pose ❌", (30, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(img, "Incomplete pose ❌", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
         else:
-            # ML Model scoring
-            features = data_row.reshape(1, -1)
-            scaled = scaler.transform(features)
-            ml_score = model.score_samples(scaled)[0]
+            # Analyze using ML Pipeline
+            feedback, scores, joint_colors, ml_score = analyze_pose_ml(data_row, scaler, model, FEATURE_NAMES)
             
-            # Calculate overall score (combine ML and rule-based)
-            if scores:
-                rule_score = np.mean(list(scores.values()))
-                overall_score = (rule_score * 0.6) + (min(100, max(0, (ml_score + 5) * 10)) * 0.4)
-            else:
-                overall_score = min(100, max(0, (ml_score + 5) * 10))
+            # Overall Score (normalized ML score)
+            # ML score is usually negative (log likelihood). 
+            # We map it: threshold -> 50%, max -> 100%
+            # This is a heuristic mapping
+            score_norm = max(0, min(100, 50 + (ml_score - auto_threshold) * 10))
             
-            # Display overall score
-            score_color = (0, 255, 0) if overall_score >= 80 else (0, 255, 255) if overall_score >= 60 else (0, 0, 255)
-            cv2.putText(img, f"Overall: {overall_score:.0f}%", (30, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, score_color, 2)
+            color = (0, 255, 0) if score_norm > 80 else (0, 255, 255) if score_norm > 50 else (0, 0, 255)
+            cv2.putText(img, f"ML Score: {score_norm:.0f}%", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
             
-            # Display component scores
-            y_offset = 80
-            if scores:
-                for component, score in scores.items():
-                    comp_color = (0, 255, 0) if score >= 80 else (0, 255, 255) if score >= 60 else (0, 0, 255)
-                    display_name = component.replace('_', ' ').title()
-                    cv2.putText(img, f"{display_name}: {score:.0f}%", (30, y_offset),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, comp_color, 2)
-                    y_offset += 30
-            
-            # Display feedback messages
-            feedback_y = h - 120
-            for i, msg in enumerate(feedback[:3]):  # Show top 3 feedback items
-                cv2.putText(img, msg, (30, feedback_y + i * 35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-            
-            # If no issues, show success message
-            if overall_score >= 85 and not feedback:
-                cv2.putText(img, "Perfect Form! ✅", (30, h - 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+            # Display Individual Scores
+            y = 80
+            for feat_name, score in scores.items():
+                s_color = (0, 255, 0) if score > 80 else (0, 255, 255) if score > 50 else (0, 0, 255)
+                cv2.putText(img, f"{feat_name}: {score:.0f}%", (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, s_color, 1)
+                y += 25
 
-        # Draw colored joint circles
-        draw_joint_circles(img, results, joint_colors)
-        
-        # Draw legend
-        draw_legend(img)
-        
+            # Feedback
+            y += 10
+            for msg in feedback[:4]:
+                cv2.putText(img, msg, (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                y += 30
+                
+            # Draw Joints
+            draw_joint_circles(img, results, joint_colors)
+
         # Draw landmarks
         if results.pose_landmarks:
             mp_drawing.draw_landmarks(img, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS,
@@ -488,10 +326,9 @@ with mp_holistic.Holistic(
             mp_drawing.draw_landmarks(img, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS,
                                      landmark_drawing_spec=mp_drawing.DrawingSpec(color=(121, 22, 76), thickness=1, circle_radius=1),
                                      connection_drawing_spec=mp_drawing.DrawingSpec(color=(250, 44, 250), thickness=2))
-
-        cv2.imshow("Arm Wrestling Form Coach", img)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
+            
+        cv2.imshow("Arm Wrestling Form Coach (ML Powered)", img)
+        if cv2.waitKey(1) & 0xFF == 27: break
 
 cap.release()
 cv2.destroyAllWindows()
